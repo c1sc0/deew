@@ -7,7 +7,7 @@
 ```
 ## DDP encoding has never been so easy!
 
-![img](https://i.kek.sh/mrgafOj2SXs.gif)
+![img](https://i.kek.sh/PUI0356sddC.gif)
 
 # Description
 - handles Dolby's XML input fuckery in the background, giving you a proper CLI interface
@@ -87,6 +87,10 @@ encode DD with 448kbps using 4 threads (input is a folder)
 `./deew.py -f thd -i *w64`\
 encode TrueHD
 
+`./deew.py -f dd -i *dts -k`\
+`./deew.py -f ddp -i *dts`\
+encode multiple formats/bitrates while creating the temp file just once
+
 # Todo
 - pyinstaller standalone exe
-- per encode progress bar
+- multiple progress bars (currently encoding progress is only shown for a single input, for multiple inputs the progress bar counts the encoded files)

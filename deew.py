@@ -6,11 +6,13 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
 import sys
-from copy import copy
+import time
+from copy import deepcopy
 from glob import glob
 from multiprocessing import Pool, cpu_count
 from typing import Any, NoReturn
@@ -18,7 +20,7 @@ from typing import Any, NoReturn
 import toml
 import xmltodict
 from rich import print
-from rich.progress import track
+from rich.progress import BarColumn, Progress, TimeRemainingColumn, track
 
 from logos import logos
 
@@ -33,7 +35,7 @@ parser.add_argument('-h', '--help',
                     help='shows this help message.')
 parser.add_argument('-v', '--version',
                     action='version',
-                    version='deew 1.2',
+                    version='deew 1.2.6',
                     help='shows version.')
 parser.add_argument('-i', '--input',
                     nargs='*',
@@ -68,17 +70,50 @@ parser.add_argument('-k', '--keeptemp',
 parser.add_argument('-pl', '--printlogos',
                     action='store_true',
                     help='show all logo variants you can set in the config')
+parser.add_argument('-cl', '--changelog',
+                    action='store_true',
+                    help='print changelog')
 args = parser.parse_args()
+
+
+def print_changelog() -> None:
+    import requests
+
+    try:
+        changelog = requests.get('https://raw.githubusercontent.com/pcroland/deew/main/changelog.md').text.split('\n')
+    except Exception:
+        print_exit('[red]ERROR: couldn\'t fetch changelog from GitHub.[/red]')
+
+    for line in changelog:
+        line = line.replace('\\', '')
+        if line.startswith('# '):
+            line = f'[bold color(231)]{line.replace("# ", "")}[/bold color(231)]'
+        code_number = line.count('`')
+        state_even = False
+        for _ in range(code_number):
+            if not state_even:
+                line = line.replace('`', '[bold yellow]', 1)
+                state_even = True
+            else:
+                line = line.replace('`', '[/bold yellow]', 1)
+                state_even = False
+        print(f'[not bold]{line}[/not bold]')
+    sys.exit(0)
 
 
 def print_logos() -> None:
     for i in range(len(logos)):
         print(f'logo {i + 1}:\n{logos[i]}')
-    sys.exit(1)
+    sys.exit(0)
 
 
 def clamp(inp: int, low: int, high: int) -> int:
     return min(max(inp, low), high)
+
+
+def stamp_to_sec(stamp):
+    l = stamp.split(':')
+    return int(l[0])*3600 + int(l[1])*60 + float(l[2])
 
 
 def find_closest_allowed(value: int, allowed_values: list[int]) -> int:
@@ -122,11 +157,47 @@ def createdir(out: str) -> None:
 
 
 def encode(settings: list) -> None:
-    fl, output, ffmpeg_args, dee_args, intermediate_exists = settings
+    fl, output, length, ffmpeg_args, dee_args, intermediate_exists, multiple_files = settings
 
-    if not intermediate_exists:
-        subprocess.run(ffmpeg_args, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    subprocess.run(dee_args, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+    if multiple_files:
+        if not intermediate_exists:
+            subprocess.run(ffmpeg_args, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.run(dee_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='ignore')
+    else:
+        fl_b = os.path.basename(fl)
+        with Progress('{task.description}', BarColumn(), '[magenta]{task.percentage:>3.1f}%', TimeRemainingColumn(), refresh_per_second=10) as pb:
+            task = pb.add_task(f'[ [bold][cyan]starting[/cyan][/bold]...{" " * 24}]', total=100)
+            if not intermediate_exists:
+                task_name = f'[magenta]{fl_b[:23]}[/magenta]...' if len(fl_b) > 26 else f'[magenta]{fl_b.ljust(26)}[/magenta]'
+                pb.update(description=f'[ [bold][cyan]ffmpeg[/cyan][/bold] | {task_name}' + ']', task_id=task, completed=0)
+                ffmpeg = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore')
+                percentage_length = length / 100
+                with ffmpeg.stdout:
+                    for line in iter(ffmpeg.stdout.readline, ''):
+                        if '=' not in line: continue
+                        progress = re.search(r'time=([^\s]+)', line)
+                        if progress:
+                            timecode = stamp_to_sec(progress[1]) / percentage_length
+                            pb.update(task_id=task, completed=timecode)
+                pb.update(task_id=task, completed=100)
+                time.sleep(0.5)
+
+            task_name = f'[magenta]{fl_b[:17]}[/magenta]...' if len(fl_b) > 20 else f'[magenta]{fl_b.ljust(20)}[/magenta]'
+            pb.update(description=f'[ [bold][cyan]dee[/cyan][/bold]: measure | {task_name}' + ']', task_id=task, completed=0)
+            dee = subprocess.Popen(dee_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='ignore')
+            with dee.stdout:
+                for line in iter(dee.stdout.readline, ''):
+                    if re.search(r'(Step: encoding)', line):
+                        task_name = f'[magenta]{fl_b[:18]}[/magenta]...' if len(fl_b) > 21 else f'[magenta]{fl_b.ljust(21)}[/magenta]'
+                        pb.update(description=f'[ [bold][cyan]dee[/cyan][/bold]: encode | {task_name}' + ']', task_id=task)
+
+                    progress = re.search(r'Overall progress: ([0-9]+\.[0-9])', line)
+                    if progress:
+                        pb.update(task_id=task, completed=float(progress[1]))
+
+                    if 'error' in line.lower():
+                        print(line.rstrip().split(': ', 1)[1])
+            pb.update(task_id=task, completed=100)
 
     if not args.keeptemp:
         os.remove(os.path.join(config['temp_path'], basename(fl, 'wav')))
@@ -142,6 +213,8 @@ def main() -> None:
         parser.print_help(sys.stderr)
         sys.exit(1)
 
+    if args.changelog: print_changelog()
+
     if args.printlogos: print_logos()
     if 0 < config['logo'] < len(logos) + 1: print(logos[config['logo'] - 1])
 
@@ -149,14 +222,14 @@ def main() -> None:
     bitrate = args.bitrate
     mix = args.mix
 
-    if aformat not in ['dd', 'ddp', 'thd']: print_exit(
-        '[red]ERROR: [bold yellow]-f[/bold yellow]/[bold yellow]--format[/bold yellow] can only be [bold yellow]dd[/bold yellow], [bold yellow]ddp[/bold yellow] or [bold yellow]thd[/bold yellow].[/red]')
-    if mix and mix not in [6, 8]: print_exit(
-        '[red]ERROR: [bold yellow]-m[/bold yellow]/[bold yellow]--mix[/bold yellow] can only be [bold yellow]6[/bold yellow] or [bold yellow]8[/bold yellow].[/red]')
-    if args.drc not in ['film_light', 'film_standard', 'music_light', 'music_standard', 'speech']: print_exit(
-        '[red]ERROR: allowed DRC values: [bold yellow]film_light[/bold yellow], [bold yellow]film_standard[/bold yellow], [bold yellow]music_light[/bold yellow], [bold yellow]music_standard[/bold yellow], [bold yellow]speech[/bold yellow].[/red]')
-    if platform.system == 'Linux' and not wsl and aformat == 'thd': print_exit(
-        '[red]Linux version of DEE does not support TrueHD encoding. set wsl to true in config and use Windows version.[/red]')
+    if aformat not in ['dd', 'ddp', 'thd']:
+        print_exit('[red]ERROR: [bold yellow]-f[/bold yellow]/[bold yellow]--format[/bold yellow] can only be [bold yellow]dd[/bold yellow], [bold yellow]ddp[/bold yellow] or [bold yellow]thd[/bold yellow].[/red]')
+    if mix and mix not in [6, 8]:
+        print_exit('[red]ERROR: [bold yellow]-m[/bold yellow]/[bold yellow]--mix[/bold yellow] can only be [bold yellow]6[/bold yellow] or [bold yellow]8[/bold yellow].[/red]')
+    if args.drc not in ['film_light', 'film_standard', 'music_light', 'music_standard', 'speech']:
+        print_exit('[red]ERROR: allowed DRC values: [bold yellow]film_light[/bold yellow], [bold yellow]film_standard[/bold yellow], [bold yellow]music_light[/bold yellow], [bold yellow]music_standard[/bold yellow], [bold yellow]speech[/bold yellow].[/red]')
+    if platform.system() == 'Linux' and not wsl and aformat == 'thd':
+        print_exit('[red]Linux version of DEE does not support TrueHD encoding. set wsl to true in config and use Windows version of DEE.[/red]')
 
     filelist = []
     for f in args.input:
@@ -170,6 +243,7 @@ def main() -> None:
     samplerate_list = []
     channels_list = []
     bit_depth_list = []
+    length_list = []
 
     for f in filelist:
         probe_args = [config["ffprobe_path"], '-v', 'quiet', '-select_streams', 'a:0', '-print_format', 'json', '-show_format', '-show_streams', f]
@@ -177,6 +251,7 @@ def main() -> None:
         audio = json.loads(output)['streams'][0]
         samplerate_list.append(int(audio['sample_rate']))
         channels_list.append(audio['channels'])
+        length_list.append(float(audio.get('duration', 5400)))
         depth = int(audio.get('bits_per_sample', 0))
         if depth == 0: depth = int(audio.get('bits_per_raw_sample', 32))
         bit_depth_list.append(depth)
@@ -200,9 +275,9 @@ def main() -> None:
             bit_depth = 32
 
     if channels not in [6, 8]: print_exit('''[red]ERROR: number of channels can only be [bold yellow]6[/bold yellow] or [bold yellow]8[/bold yellow].
-For mono and stereo encoding use [bold blue]qaac[/bold blue] or [bold blue]opus[/bold blue].
-For surround tracks with weird channel layouts use [bold blue]Dolby Media Producer[/bold blue] to encode them as is
-or use [bold blue]ffmpeg[/bold blue] to remap them ([bold yellow]-ac 6[/bold yellow]/[bold yellow]8[/bold yellow] or [bold yellow]-af "pan=filter"[/bold yellow] for more control) before encoding.[/red]''')
+For mono and stereo encoding use [bold cyan]qaac[/bold cyan] or [bold cyan]opus[/bold cyan].
+For surround tracks with weird channel layouts use [bold cyan]Dolby Media Producer[/bold cyan] to encode them as is
+or use [bold cyan]ffmpeg[/bold cyan] to remap them ([bold yellow]-ac 6[/bold yellow]/[bold yellow]8[/bold yellow] or [bold yellow]-af "pan=filter"[/bold yellow] for more control) before encoding.[/red]''')
 
     if args.output:
         createdir(os.path.abspath(args.output))
@@ -277,7 +352,9 @@ or use [bold blue]ffmpeg[/bold blue] to remap them ([bold yellow]-ac 6[/bold yel
     threads = clamp(args.threads, 1, cpu_count() - 1)
     pool = Pool(threads)
 
+    multiple_files = False
     if len(filelist) > 1:
+        multiple_files = True
         print(f'[bold color(231)]Running the following commands for the encodes ([cyan]{min(len(filelist), threads)}[/cyan] at a time):[/bold color(231)]')
     else:
         print('[bold color(231)]Running the following commands for the encode:[/bold color(231)]')
@@ -301,9 +378,9 @@ or use [bold blue]ffmpeg[/bold blue] to remap them ([bold yellow]-ac 6[/bold yel
             resample_args_print = ''
 
         ffmpeg_args = [config['ffmpeg_path'], '-y', '-drc_scale', '0', '-i', filelist[i], '-c:a:0', f'pcm_s{bit_depth}le', *(resample_args), '-rf64', 'always', os.path.join(config['temp_path'], basename(filelist[i], 'wav'))]
-        ffmpeg_args_print = f'[bold blue]ffmpeg[/bold blue] -y -drc_scale [bold color(231)]0[/bold color(231)] -i [bold green]{filelist[i]}[/bold green] [not bold white]-c:a[/not bold white]' + f'[not bold white]:0[/not bold white] [bold color(231)]pcm_s{bit_depth}le[/bold color(231)] {resample_args_print}-rf64 [bold color(231)]always[/bold color(231)] [bold magenta]{os.path.join(config["temp_path"], basename(filelist[i], "wav"))}[/bold magenta]'
-        dee_args = [config['dee_path'], '-x', dee_xml_input]
-        dee_args_print = f'[bold blue]dee[/bold blue] -x [bold magenta]{dee_xml_input}[/bold magenta]'
+        ffmpeg_args_print = f'[bold cyan]ffmpeg[/bold cyan] -y -drc_scale [bold color(231)]0[/bold color(231)] -i [bold green]{filelist[i]}[/bold green] [not bold white]-c:a[/not bold white]' + f'[not bold white]:0[/not bold white] [bold color(231)]pcm_s{bit_depth}le[/bold color(231)] {resample_args_print}-rf64 [bold color(231)]always[/bold color(231)] [bold magenta]{os.path.join(config["temp_path"], basename(filelist[i], "wav"))}[/bold magenta]'
+        dee_args = [config['dee_path'], '--progress-interval', '500', '--diagnostics-interval', '90000', '-x', dee_xml_input]
+        dee_args_print = f'[bold cyan]dee[/bold cyan] -x [bold magenta]{dee_xml_input}[/bold magenta]'
 
         intermediate_exists = False
         if os.path.exists(os.path.join(config['temp_path'], basename(filelist[i], 'wav'))):
@@ -312,7 +389,7 @@ or use [bold blue]ffmpeg[/bold blue] to remap them ([bold yellow]-ac 6[/bold yel
         else:
             print(f'{ffmpeg_args_print} && {dee_args_print}')
 
-        xml = copy(xml_base)
+        xml = deepcopy(xml_base)
         xml['job_config']['input']['audio']['wav']['file_name'] = f'\"{basename(filelist[i], "wav")}\"'
         if aformat == 'ddp':
             if channels == 8:
@@ -327,10 +404,12 @@ or use [bold blue]ffmpeg[/bold blue] to remap them ([bold yellow]-ac 6[/bold yel
             xml['job_config']['output']['mlp']['file_name'] = f'\"{basename(filelist[i], "thd")}\"'
         save_xml(os.path.join(config['temp_path'], basename(filelist[i], 'xml')), xml)
 
-        settings.append([filelist[i], output, ffmpeg_args, dee_args, intermediate_exists])
+        settings.append([filelist[i], output, length_list[i], ffmpeg_args, dee_args, intermediate_exists, multiple_files])
 
-    list(track(pool.imap_unordered(encode, settings), total=len(filelist), description='encoding...'))
-
+    if multiple_files:
+        list(track(pool.imap_unordered(encode, settings), total=len(filelist), description='encoding...'))
+    else:
+        list(pool.imap_unordered(encode, settings))
 
 script_path = os.path.dirname(__file__)
 
@@ -357,5 +436,5 @@ if not shutil.which(config['ffprobe_path']): print_exit(
 
 wsl = config['wsl']
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
