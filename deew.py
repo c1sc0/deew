@@ -106,6 +106,27 @@ def print_logos() -> None:
         print(f'logo {i + 1}:\n{logos[i]}')
     sys.exit(0)
 
+def update_progress_worker(q):
+    with Progress() as progress:
+
+        # this is here 'cause the progress has no tasks, the while condition will be always !true
+        task_id, percentage = q.get()
+        progress.add_task(f"[red] task {task_id}")
+        q.task_done()
+
+        while not progress.finished:
+
+            task_id, percentage = q.get()
+
+            if task_id not in progress.task_ids:
+                progress.add_task(f"[red] task {task_id}")
+
+            for t in progress.tasks:
+                if t.id == task_id:
+                    while t.percentage < percentage:
+                        progress.update(task_id, advance=1)
+            q.task_done()
+            time.sleep(0.02)
 
 def clamp(inp: int, low: int, high: int) -> int:
     return min(max(inp, low), high)
@@ -157,47 +178,46 @@ def createdir(out: str) -> None:
 
 
 def encode(settings: list) -> None:
-    fl, output, length, ffmpeg_args, dee_args, intermediate_exists, multiple_files = settings
-
+    fl, output, length, ffmpeg_args, dee_args, intermediate_exists, multiple_files, queue = settings
+    task_id, q = queue
     if multiple_files:
         if not intermediate_exists:
             subprocess.run(ffmpeg_args, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         subprocess.run(dee_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='ignore')
     else:
         fl_b = os.path.basename(fl)
-        with Progress('{task.description}', BarColumn(), '[magenta]{task.percentage:>3.1f}%', TimeRemainingColumn(), refresh_per_second=10) as pb:
-            task = pb.add_task(f'[ [bold][cyan]starting[/cyan][/bold]...{" " * 24}]', total=100)
-            if not intermediate_exists:
-                task_name = f'[magenta]{fl_b[:23]}[/magenta]...' if len(fl_b) > 26 else f'[magenta]{fl_b.ljust(26)}[/magenta]'
-                pb.update(description=f'[ [bold][cyan]ffmpeg[/cyan][/bold] | {task_name}' + ']', task_id=task, completed=0)
-                ffmpeg = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore')
-                percentage_length = length / 100
-                with ffmpeg.stdout:
-                    for line in iter(ffmpeg.stdout.readline, ''):
-                        if '=' not in line: continue
-                        progress = re.search(r'time=([^\s]+)', line)
-                        if progress:
-                            timecode = stamp_to_sec(progress[1]) / percentage_length
-                            pb.update(task_id=task, completed=timecode)
-                pb.update(task_id=task, completed=100)
-                time.sleep(0.5)
 
-            task_name = f'[magenta]{fl_b[:17]}[/magenta]...' if len(fl_b) > 20 else f'[magenta]{fl_b.ljust(20)}[/magenta]'
-            pb.update(description=f'[ [bold][cyan]dee[/cyan][/bold]: measure | {task_name}' + ']', task_id=task, completed=0)
-            dee = subprocess.Popen(dee_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='ignore')
-            with dee.stdout:
-                for line in iter(dee.stdout.readline, ''):
-                    if re.search(r'(Step: encoding)', line):
-                        task_name = f'[magenta]{fl_b[:18]}[/magenta]...' if len(fl_b) > 21 else f'[magenta]{fl_b.ljust(21)}[/magenta]'
-                        pb.update(description=f'[ [bold][cyan]dee[/cyan][/bold]: encode | {task_name}' + ']', task_id=task)
 
-                    progress = re.search(r'Overall progress: ([0-9]+\.[0-9])', line)
+        if not intermediate_exists:
+            task_name = f'[magenta]{fl_b[:23]}[/magenta]...' if len(fl_b) > 26 else f'[magenta]{fl_b.ljust(26)}[/magenta]'
+            queue.put((task_id, 0))
+            ffmpeg = subprocess.Popen(ffmpeg_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, encoding='utf-8', errors='ignore')
+            percentage_length = length / 100
+            with ffmpeg.stdout:
+                for line in iter(ffmpeg.stdout.readline, ''):
+                    if '=' not in line: continue
+                    progress = re.search(r'time=([^\s]+)', line)
                     if progress:
-                        pb.update(task_id=task, completed=float(progress[1]))
+                        timecode = stamp_to_sec(progress[1]) / percentage_length
+                        queue.put((task, timecode))
+            time.sleep(0.5)
 
-                    if 'error' in line.lower():
-                        print(line.rstrip().split(': ', 1)[1])
-            pb.update(task_id=task, completed=100)
+        task_name = f'[magenta]{fl_b[:17]}[/magenta]...' if len(fl_b) > 20 else f'[magenta]{fl_b.ljust(20)}[/magenta]'
+        pb.update(description=f'[ [bold][cyan]dee[/cyan][/bold]: measure | {task_name}' + ']', task_id=task, completed=0)
+        dee = subprocess.Popen(dee_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='ignore')
+        with dee.stdout:
+            for line in iter(dee.stdout.readline, ''):
+                if re.search(r'(Step: encoding)', line):
+                    task_name = f'[magenta]{fl_b[:18]}[/magenta]...' if len(fl_b) > 21 else f'[magenta]{fl_b.ljust(21)}[/magenta]'
+                    pb.update(description=f'[ [bold][cyan]dee[/cyan][/bold]: encode | {task_name}' + ']', task_id=task)
+
+                progress = re.search(r'Overall progress: ([0-9]+\.[0-9])', line)
+                if progress:
+                    pb.update(task_id=task, completed=float(progress[1]))
+
+                if 'error' in line.lower():
+                    print(line.rstrip().split(': ', 1)[1])
+        pb.update(task_id=task, completed=100)
 
     if not args.keeptemp:
         os.remove(os.path.join(config['temp_path'], basename(fl, 'wav')))
@@ -358,7 +378,8 @@ or use [bold cyan]ffmpeg[/bold cyan] to remap them ([bold yellow]-ac 6[/bold yel
         print(f'[bold color(231)]Running the following commands for the encodes ([cyan]{min(len(filelist), threads)}[/cyan] at a time):[/bold color(231)]')
     else:
         print('[bold color(231)]Running the following commands for the encode:[/bold color(231)]')
-
+    m = multiprocessing.Manager()
+    queue = m.Queue()
     for i in range(len(filelist)):
         dee_xml_input = f'{dee_xml_input_base}{basename(filelist[i], "xml")}'
         if aformat in ['dd', 'ddp'] and samplerate != 48000:
@@ -404,7 +425,11 @@ or use [bold cyan]ffmpeg[/bold cyan] to remap them ([bold yellow]-ac 6[/bold yel
             xml['job_config']['output']['mlp']['file_name'] = f'\"{basename(filelist[i], "thd")}\"'
         save_xml(os.path.join(config['temp_path'], basename(filelist[i], 'xml')), xml)
 
-        settings.append([filelist[i], output, length_list[i], ffmpeg_args, dee_args, intermediate_exists, multiple_files])
+        settings.append([filelist[i], output, length_list[i], ffmpeg_args, dee_args, intermediate_exists, multiple_files], [i, queue])
+
+
+    thread = threading.Thread(target=update_progress_worker, daemon=True, args=[queue])
+    thread.start()
 
     if multiple_files:
         list(track(pool.imap_unordered(encode, settings), total=len(filelist), description='encoding...'))
